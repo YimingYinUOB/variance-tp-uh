@@ -8,24 +8,29 @@ function out = estimate_Tp_timevariance(rainfall, runoff, uh, t)
 %
 % INPUTS
 %   rainfall : 1xN or Nx1 numeric, rainfall intensity (e.g., mm/h), non-negative
-%   runoff   : 1xN or Nx1 numeric, direct runoff (e.g., mm/h), non-negative
+%   runoff   : 1xN or Nx1 numeric, direct runoff (mm/h), non-negative
 %   uh       : struct specifying UH shape (only ONE free timing parameter Tp):
-%              - ReFH (standard): uh.type = 'refh',   uh.Up = 0.65, uh.Uk = 0.8
-%              - Triangular     : uh.type = 'triangular'            (Up=0.5, Uk=1)
-%              - Gamma (Nash)   : uh.type = 'gamma', uh.alpha > 1
-%   t        : (optional) 1xN or Nx1 time in hours; if omitted, uses 0:(N-1)
+%              % -- allowed values only:
+%              %   uh.type = 'refh'       (ReFH standard; Up, Uk fixed)
+%              %   uh.type = 'triangular' (ReFH triangular; Up=0.5, Uk=1)
+%              %   uh.type = 'gamma'      (Nash–Gamma; alpha>1)
+%              %
+%              % fields per type:
+%              %   'refh'      -> uh.Up (default 0.65), uh.Uk (default 0.8)
+%              %   'triangular'-> no extra fields (uses Up=0.5, Uk=1)
+%              %   'gamma'     -> uh.alpha (required, >1)
+%   t        : (optional) 1xN or Nx1 time in hours or datetime; if omitted, uses 0:(N-1)
 %
 % OUTPUT (struct)
-%   out.Tp_est   : estimated Tp (hours)
-%   out.Var_tP   : time variance of rainfall (h^2)
-%   out.Var_tQ   : time variance of runoff   (h^2)
-%   out.Var_TU   : inferred UH variance = Var(tQ) - Var(tP) (h^2)
-%   out.c        : shape constant c = sqrt(Var(T_U^(1)))
+%   out.Tp_est : estimated Tp (hours)
+%   out.Var_tP : time variance of rainfall (h^2)
+%   out.Var_tQ : time variance of runoff   (h^2)
+%   out.Var_TU : inferred UH variance = Var(tQ) - Var(tP) (h^2)
+%   out.c      : shape constant c = sqrt(Var(T_U^(1)))
 %
 % NOTES
-% - Multiplying rainfall by a constant (e.g., using an event runoff coefficient)
-%   does NOT change Var(t_P) because the weight normalization cancels the factor.
-% - Ensure runoff is direct runoff。
+% - Scaling rainfall by a constant (e.g., an event runoff coefficient) does not change Var(t_P).
+% - Ensure 'runoff' is direct runoff (baseflow removed at event scale if needed).
 
     % ---------- inputs & time vector ----------
     P = rainfall(:)'; Q = runoff(:)';
@@ -35,15 +40,14 @@ function out = estimate_Tp_timevariance(rainfall, runoff, uh, t)
     N = numel(P);
 
     if nargin < 4 || isempty(t)
-        t = 0:(N-1);             % hours, starting at 0
+        t = 0:(N-1);                 % hours, starting at 0
     else
-        t = t(:)';               % to row
+        t = t(:)';                   % row
         if numel(t) ~= N, error('t must have the same length as rainfall/runoff.'); end
-        % make it start from 0 hours for numerical stability
         if isdatetime(t)
-            t = hours(t - t(1));
+            t = hours(t - t(1));     % convert and start from 0
         else
-            t = t - t(1);
+            t = t - t(1);            % start from 0
         end
     end
 
@@ -52,8 +56,8 @@ function out = estimate_Tp_timevariance(rainfall, runoff, uh, t)
     Var_tQ = local_time_variance(t, Q);
     Var_TU = max(Var_tQ - Var_tP, 0);  % numerical safeguard
 
-    % ---------- shape constant c ----------
-    c = local_shape_constant(uh);
+    % ---------- shape constant c (only 'refh' | 'triangular' | 'gamma') ----------
+    c = local_shape_constant_strict(uh);
 
     % ---------- Tp ----------
     Tp_est = sqrt(Var_TU) / c;
@@ -68,8 +72,9 @@ function v = local_time_variance(t, x)
     if numel(t) < 2 || all(x==0)
         v = NaN; return;
     end
-    % dt for possibly non-even spacing
-    dt = [diff(t), max(1e-12, t(end)-t(end-1))];
+    % robust dt (handles non-even spacing)
+    dt_last = max(1e-12, t(end) - t(max(1,end-1)));
+    dt = [diff(t), dt_last];
     w  = x .* dt;                     % volume weights
     W  = sum(w);
     if W <= 0, v = NaN; return; end
@@ -78,15 +83,23 @@ function v = local_time_variance(t, x)
     v   = Et2 - Et^2;                 % h^2
 end
 
-% ===== helper: UH shape constant c = sqrt(Var(T_U^(1))) =====
-function c = local_shape_constant(uh)
-    if ~isfield(uh,'type'); error('uh.type is required: refh | triangular | gamma'); end
-    switch lower(uh.type)
+% ===== helper: UH shape constant c = sqrt(Var(T_U^(1))) with strict types =====
+function c = local_shape_constant_strict(uh)
+    if ~isfield(uh,'type')
+        error('uh.type is required and must be one of: ''refh'', ''triangular'', ''gamma''.');
+    end
+
+    tname = lower(string(uh.type));
+    valid = ["refh","triangular","gamma"];
+    if ~any(tname == valid)
+        error('Invalid uh.type = ''%s''. Allowed: ''refh'', ''triangular'', ''gamma''.', uh.type);
+    end
+
+    switch char(tname)
         case 'refh'
-            % Standard UK recommended values if not provided
             if ~isfield(uh,'Up'), uh.Up = 0.65; end
             if ~isfield(uh,'Uk'), uh.Uk = 0.8;  end
-            % For hourly discrete grid, Var(T_U^(1)) ≈ 0.533, so c ≈ 0.73
+            % Hourly discrete grid for ReFH (Up=0.65, Uk=0.8): Var ≈ 0.533 -> c ≈ 0.73
             c = sqrt(0.533);
 
         case 'triangular'
@@ -94,13 +107,15 @@ function c = local_shape_constant(uh)
             c = sqrt(13/18);   % ≈ 0.84984
 
         case 'gamma'
-            if ~isfield(uh,'alpha'), error('gamma UH: uh.alpha (>1) is required.'); end
+            if ~isfield(uh,'alpha')
+                error('For uh.type=''gamma'', uh.alpha (>1) is required.');
+            end
             alpha = uh.alpha;
-            if alpha <= 1, error('gamma UH: alpha must be > 1.'); end
-            % Var(T_U^(1)) = alpha/(alpha-1)^2
+            if ~isscalar(alpha) || ~isfinite(alpha) || alpha <= 1
+                error('For uh.type=''gamma'', uh.alpha must be a finite scalar > 1.');
+            end
+            % Var(T_U^(1)) = alpha/(alpha-1)^2  => c = sqrt(alpha)/(alpha-1)
             c = sqrt(alpha) / (alpha - 1);
-
-        otherwise
-            error('Unknown uh.type: %s', uh.type);
     end
 end
+
